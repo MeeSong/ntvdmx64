@@ -32,21 +32,21 @@
 #include "basemsg64.h"
 #include "basevdm.h"
 #include "symeng.h"
+#include "detour.h"
+#include "consbmp.h"
 
 #pragma comment(lib, "ntdll.lib")
-
-//#define TRACING
-
-#ifdef TRACING
-#define TRACE(...) { char szDbgBuf[2048]; wsprintfA(szDbgBuf, __VA_ARGS__); OutputDebugStringA(szDbgBuf); }
-#else
-#define TRACE(...)
-#endif
 
 #ifdef _WIN64
 #define BASEP_CALL __fastcall
 #else
 #define BASEP_CALL WINAPI
+#endif
+
+#ifdef TARGET_WIN7
+#define KRNL32_CALL BASEP_CALL
+#else
+#define KRNL32_CALL __fastcall
 #endif
 
 typedef INT_PTR(BASEP_CALL *fpBasepProcessInvalidImage)(NTSTATUS Error, HANDLE TokenHandle,
@@ -58,12 +58,25 @@ typedef INT_PTR(BASEP_CALL *fpBasepProcessInvalidImage)(NTSTATUS Error, HANDLE T
 	PUNICODE_STRING pUnicodeStringEnv, PDWORD pVDMCreationState, PULONG pVdmBinaryType, PDWORD pbVDMCreated,
 	PHANDLE pVdmWaitHandle);
 
+typedef BOOL(BASEP_CALL *fpCreateProcessInternalW)(HANDLE hToken,
+	LPCWSTR lpApplicationName,
+	LPWSTR lpCommandLine,
+	LPSECURITY_ATTRIBUTES lpProcessAttributes,
+	LPSECURITY_ATTRIBUTES lpThreadAttributes,
+	BOOL bInheritHandles,
+	DWORD dwCreationFlags,
+	LPVOID lpEnvironment,
+	LPCWSTR lpCurrentDirectory,
+	LPSTARTUPINFOW lpStartupInfo,
+	LPPROCESS_INFORMATION lpProcessInformation,
+	PHANDLE hNewToken
+	);
 
 typedef ULONG(BASEP_CALL *fpBaseIsDosApplication)(
 	IN PUNICODE_STRING  	PathName,
 	IN NTSTATUS  	Status
 	);
-typedef BOOL(__fastcall *fpBaseCheckVDM)(
+typedef BOOL(KRNL32_CALL *fpBaseCheckVDM)(
 	IN	ULONG BinaryType,
 	IN	PCWCH lpApplicationName,
 	IN	PCWCH lpCommandLine,
@@ -75,24 +88,103 @@ typedef BOOL(__fastcall *fpBaseCheckVDM)(
 	LPSTARTUPINFOW lpStartupInfo,
 	IN HANDLE hUserToken
 	);
-typedef BOOL(__fastcall *fpBaseCreateVDMEnvironment)(
+
+typedef BOOL(KRNL32_CALL *fpBaseCreateVDMEnvironment)(
 	LPWSTR  lpEnvironment,
 	ANSI_STRING *pAStringEnv,
 	UNICODE_STRING *pUStringEnv
 	);
-typedef BOOL (__fastcall *fpBaseGetVdmConfigInfo)(
+typedef BOOL (KRNL32_CALL *fpBaseGetVdmConfigInfo)(
 	IN  LPCWSTR CommandLine,
 	IN  ULONG  DosSeqId,
 	IN  ULONG  BinaryType,
 	IN  PUNICODE_STRING CmdLineString
+#ifdef TARGET_WIN7
+	,OUT PULONG VdmSize
+#endif
 	);
+	
+#define WOW16_SUPPORT
+#ifdef WOW16_SUPPORT
+typedef NTSTATUS (NTAPI *fpNtCreateUserProcess)(
+	PHANDLE ProcessHandle,
+	PHANDLE ThreadHandle,
+	ACCESS_MASK ProcessDesiredAccess,
+	ACCESS_MASK ThreadDesiredAccess,
+	POBJECT_ATTRIBUTES ProcessObjectAttributes,
+	POBJECT_ATTRIBUTES ThreadObjectAttributes,
+	ULONG ProcessFlags,
+	ULONG ThreadFlags,
+	PRTL_USER_PROCESS_PARAMETERS ProcessParameters,
+	PVOID CreateInfo,
+	PVOID AttributeList
+	);
+fpNtCreateUserProcess NtCreateUserProcessReal;
+NTSTATUS LastCreateUserProcessError = STATUS_SUCCESS;
+NTSTATUS NTAPI NtCreateUserProcessHook(
+	PHANDLE ProcessHandle,
+	PHANDLE ThreadHandle,
+	ACCESS_MASK ProcessDesiredAccess,
+	ACCESS_MASK ThreadDesiredAccess,
+	POBJECT_ATTRIBUTES ProcessObjectAttributes,
+	POBJECT_ATTRIBUTES ThreadObjectAttributes,
+	ULONG ProcessFlags,
+	ULONG ThreadFlags,
+	PRTL_USER_PROCESS_PARAMETERS ProcessParameters,
+	PVOID CreateInfo,
+	PVOID AttributeList
+	)
+{
+#if defined(TARGET_WIN7) && !defined(CREATEPROCESS_HOOK)
+	UpdateSymbolCache();
+#endif
+	LastCreateUserProcessError = NtCreateUserProcessReal(ProcessHandle,
+		ThreadHandle,
+		ProcessDesiredAccess,
+		ThreadDesiredAccess,
+		ProcessObjectAttributes,
+		ThreadObjectAttributes,
+		ProcessFlags,
+		ThreadFlags,
+		ProcessParameters,
+		CreateInfo,
+		AttributeList);
+
+	return LastCreateUserProcessError==STATUS_INVALID_IMAGE_WIN_16?STATUS_INVALID_IMAGE_PROTECT:LastCreateUserProcessError;
+}
+#endif
 
 
-fpBasepProcessInvalidImage BasepProcessInvalidImageReal;
+fpBasepProcessInvalidImage BasepProcessInvalidImageReal = NULL;
 fpBaseIsDosApplication BaseIsDosApplication = NULL;
 fpBaseCheckVDM BaseCheckVDM = NULL;
 fpBaseCreateVDMEnvironment BaseCreateVDMEnvironment = NULL;
 fpBaseGetVdmConfigInfo BaseGetVdmConfigInfo = NULL;
+fpCreateProcessInternalW CreateProcessInternalW = NULL;
+
+BOOL __declspec(dllexport) BASEP_CALL NtVdm64CreateProcessInternalW(HANDLE hToken,
+	LPCWSTR lpApplicationName,
+	LPWSTR lpCommandLine,
+	LPSECURITY_ATTRIBUTES lpProcessAttributes,
+	LPSECURITY_ATTRIBUTES lpThreadAttributes,
+	BOOL bInheritHandles,
+	DWORD dwCreationFlags,
+	LPVOID lpEnvironment,
+	LPCWSTR lpCurrentDirectory,
+	LPSTARTUPINFOW lpStartupInfo,
+	LPPROCESS_INFORMATION lpProcessInformation,
+	PHANDLE hNewToken
+	)
+{
+	if (!CreateProcessInternalW)
+	{
+		if (!(CreateProcessInternalW = (fpCreateProcessInternalW)GetProcAddress(GetModuleHandle(_T("kernel32.dll")), "CreateProcessInternalW")))
+			return FALSE;
+	}
+	return CreateProcessInternalW(hToken, lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles,
+		dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation, hNewToken);
+}
+
 
 INT_PTR BASEP_CALL BasepProcessInvalidImage(NTSTATUS Error, HANDLE TokenHandle,
 	LPCWSTR dosname, LPCWSTR *lppApplicationName,
@@ -107,8 +199,15 @@ INT_PTR BASEP_CALL BasepProcessInvalidImage(NTSTATUS Error, HANDLE TokenHandle,
 	ULONG BinarySubType = BINARY_TYPE_DOS_EXE;
 
 	TRACE("LDNTVDM: BasepProcessInvalidImage(%08X,'%ws');", Error, PathName->Buffer);
+#ifdef WOW16_SUPPORT
+	if (LastCreateUserProcessError == STATUS_INVALID_IMAGE_WIN_16 && Error == STATUS_INVALID_IMAGE_PROTECT)
+	{
+		TRACE("LDNTVDM: Launching Win16 application");
+		Error = LastCreateUserProcessError;
+	}
+#endif
 	if (Error == STATUS_INVALID_IMAGE_PROTECT ||
-		(Error == STATUS_INVALID_IMAGE_NOT_MZ && BaseIsDosApplication && 
+		(Error == STATUS_INVALID_IMAGE_NOT_MZ && BaseIsDosApplication &&
 			(BinarySubType = BaseIsDosApplication(PathName, Error))))
 	{
 #ifdef WOW_HACK
@@ -120,7 +219,7 @@ INT_PTR BASEP_CALL BasepProcessInvalidImage(NTSTATUS Error, HANDLE TokenHandle,
 		if (!BaseCheckVDM)
 		{
 			// Load the private loader functions by using DbgHelp and Symbol server
-			DWORD64 dwBase, dwAddress;
+			DWORD64 dwBase = 0, dwAddress;
 			char szKernel32[MAX_PATH];
 			HMODULE hKrnl32 = GetModuleHandle(_T("kernel32.dll"));
 
@@ -153,7 +252,9 @@ INT_PTR BASEP_CALL BasepProcessInvalidImage(NTSTATUS Error, HANDLE TokenHandle,
 			// Now that we have the functions, do what the loader normally does on 32bit Windows
 			BASE_CHECKVDM_MSG *b = (BASE_CHECKVDM_MSG*)&m->u.CheckVDM;
 			NTSTATUS Status;
-
+#ifdef TARGET_WIN7
+			ULONG VdmType;
+#endif
 
 			*pVdmBinaryType = BINARY_TYPE_DOS;
 			*pVdmWaitHandle = NULL;
@@ -200,6 +301,9 @@ INT_PTR BASEP_CALL BasepProcessInvalidImage(NTSTATUS Error, HANDLE TokenHandle,
 					*piTask,
 					*pVdmBinaryType,
 					pVdmNameString
+#ifdef TARGET_WIN7
+					,&VdmType
+#endif
 					))
 				{
 					SetLastError(RtlNtStatusToDosError(Status));
@@ -213,6 +317,7 @@ INT_PTR BASEP_CALL BasepProcessInvalidImage(NTSTATUS Error, HANDLE TokenHandle,
 				break;
 
 			case VDM_PRESENT_NOT_READY:
+				TRACE("VDM_PRESENT_NOT_READY");
 				SetLastError(ERROR_NOT_READY);
 				return FALSE;
 
@@ -229,6 +334,8 @@ INT_PTR BASEP_CALL BasepProcessInvalidImage(NTSTATUS Error, HANDLE TokenHandle,
 			TRACE("LDNTVDM: Launch DOS!");
 			return TRUE;
 		}
+	} else if (Error == STATUS_INVALID_IMAGE_WIN_16) {
+		//*pdwCreationFlags |= CREATE_SEPARATE_WOW_VDM;
 #endif
 	}
 	ret = BasepProcessInvalidImageReal(Error, TokenHandle, dosname, lppApplicationName, lppCommandLine, lpCurrentDirectory,
@@ -242,8 +349,8 @@ INT_PTR BASEP_CALL BasepProcessInvalidImage(NTSTATUS Error, HANDLE TokenHandle,
 	return ret;
 }
 
-#ifdef _WIN64
 
+#ifdef _WIN64
 BOOL FixNTDLL(void)
 {
 	PVOID pNtVdmControl = GetProcAddress(GetModuleHandle(_T("ntdll.dll")), "NtVdmControl");
@@ -262,7 +369,11 @@ typedef PVOID(WINAPI *RtlAllocateHeapFunc)(PVOID  HeapHandle, ULONG  Flags, SIZE
 RtlAllocateHeapFunc RtlAllocateHeapReal;
 PVOID WINAPI RtlAllocateHeapHook(PVOID  HeapHandle, ULONG  Flags, SIZE_T Size)
 {
+#ifdef TARGET_WIN7
+	if (Size == 0x130) /* Any better idea to find correct call? */ Flags |= HEAP_ZERO_MEMORY;
+#else
 	if (Size == 0x150) /* Any better idea to find correct call? */ Flags |= HEAP_ZERO_MEMORY;
+#endif
 	return RtlAllocateHeapReal(HeapHandle, Flags, Size);
 }
 
@@ -318,8 +429,23 @@ myNtQueryInformationProcess(
 	}
 	return NtQueryInformationProcess(ProcessHandle, ProcessInformationClass, ProcessInformation, ProcessInformationLength, ReturnLength);
 }
+
+BOOL FixNTDLL(void)
+{
+	PVOID pNtVdmControl = GetProcAddress(GetModuleHandle(_T("ntdll.dll")), "NtVdmControl");
+	DWORD OldProt;
+
+	if (VirtualProtect(pNtVdmControl, 11, PAGE_EXECUTE_READWRITE, &OldProt))
+	{
+		RtlMoveMemory(pNtVdmControl, "\x8B\x54\x24\x08\xC6\x42\x04\x01\x33\xc0\xc3", 11);
+		VirtualProtect(pNtVdmControl, 11, OldProt, &OldProt);
+		return TRUE;
+	}
+	return FALSE;
+}
 #endif	// _WIN32
 
+#ifdef CREATEPROCESS_HOOK
 BOOL InjectIntoCreatedThread(LPPROCESS_INFORMATION lpProcessInformation)
 {
 	PROCESS_BASIC_INFORMATION basicInfo;
@@ -377,7 +503,109 @@ BOOL InjectIntoCreatedThread(LPPROCESS_INFORMATION lpProcessInformation)
 	}
 	return bRet;
 }
+#else /* CREATEPROCESS_HOOK */
+#ifdef _WIN64
+DWORD WINAPI InjectIntoCreatedThreadThread(LPVOID lpPID)
+{
+	HANDLE hProcess;
+	BOOL bIsWow64;
 
+	if (hProcess = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION, FALSE, lpPID))
+	{
+		IsWow64Process(hProcess, &bIsWow64);
+		/* 64 -> 32 */
+		if (bIsWow64)
+		{
+			if (!InjectLdntvdmWow64(hProcess)) OutputDebugStringA("Injecting int 32bit conhost parent failed");
+		}
+		/* 64 -> 64, 32 -> 32 */
+		else
+		{
+			if (!(injectLdrLoadDLL(hProcess, 0, LDNTVDM_NAME, METHOD_CREATETHREAD))) OutputDebugStringA("Inject LdrLoadDLL failed.");
+		}
+		CloseHandle(hProcess);
+	}
+}
+
+typedef void (WINAPI *fpNotifyWinEvent)(DWORD event, HWND hwnd, LONG idObject, LONG idChild);
+fpNotifyWinEvent NotifyWinEventReal;
+void WINAPI NotifyWinEventHook(DWORD event, HWND  hwnd, LONG  idObject, LONG  idChild)
+{
+	if (event == EVENT_CONSOLE_START_APPLICATION)
+	{
+		TRACE("EVENT_CONSOLE_START_APPLICATION PID %d", idObject);
+		// Inject ourself into the new process
+		CreateThread(NULL, 0, InjectIntoCreatedThreadThread, idObject, 0, NULL);
+	}
+	NotifyWinEventReal(event, hwnd, idObject, idChild);
+}
+#endif
+#endif /* CREATEPROCESS_HOOK*/
+
+#ifdef TARGET_WIN7
+#ifdef _WIN64
+#define REGKEY_BasepProcessInvalidImage _T("BasepProcessInvalidImage64")
+#define REGKEY_BaseIsDosApplication _T("BaseIsDosApplication64")
+#else
+#define REGKEY_BasepProcessInvalidImage _T("BasepProcessInvalidImage32")
+#define REGKEY_BaseIsDosApplication _T("BaseIsDosApplication32")
+#endif
+BOOL UpdateSymbolCache()
+{
+	HKEY hKey = NULL;
+	DWORD64 dwBase=0, dwCreated;
+	DWORD dwAddress;
+	char szKernel32[MAX_PATH];
+	static BOOL bUpdated = FALSE;
+
+	if (bUpdated) return TRUE;
+	GetSystemDirectoryA(szKernel32, sizeof(szKernel32) / sizeof(szKernel32[0]));
+	lstrcatA(szKernel32, "\\kernel32.dll");
+	if (SymEng_LoadModule(szKernel32, &dwBase) == 0 || GetLastError() == 0x1E7)
+	{
+		if (!dwBase) dwBase = GetModuleHandleA("kernel32.dll");
+		if ((dwCreated=RegCreateKeyEx(HKEY_CURRENT_USER, _T("Software\\ldntvdm"), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_READ | KEY_WRITE, NULL, &hKey, NULL)) == ERROR_SUCCESS)
+		{
+			TRACE("UpdateSymbolCache() loading kernel32 symbols");
+			if (dwAddress = SymEng_GetAddr(dwBase, "BasepProcessInvalidImage"))
+				RegSetValueEx(hKey, REGKEY_BasepProcessInvalidImage, 0, REG_DWORD, &dwAddress, sizeof(dwAddress));
+			if (dwAddress = SymEng_GetAddr(dwBase, "BaseIsDosApplication"))
+				RegSetValueEx(hKey, REGKEY_BaseIsDosApplication, 0, REG_DWORD, &dwAddress, sizeof(dwAddress));
+			RegCloseKey(hKey);
+			bUpdated = TRUE;
+		}
+		else
+		{
+			TRACE("RegCreateKeyEx failed; %08X", dwCreated);
+		}
+		SymEng_UnloadModule(dwBase);
+	}
+
+	// Also update conhost.exe symbols
+	GetSystemDirectoryA(szKernel32, sizeof(szKernel32) / sizeof(szKernel32[0]));
+	lstrcatA(szKernel32, "\\conhost.exe");
+	if (SymEng_LoadModule(szKernel32, &dwBase) == 0 || GetLastError() == 0x1E7)
+	{
+		if (!dwBase) dwBase = GetModuleHandleA("conhost.exe");
+		if ((dwCreated = RegCreateKeyEx(HKEY_CURRENT_USER, _T("Software\\ldntvdm"), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_READ | KEY_WRITE, NULL, &hKey, NULL)) == ERROR_SUCCESS)
+		{
+			TRACE("UpdateSymbolCache() loading conhost symbols");
+			if (dwAddress = SymEng_GetAddr(dwBase, "dwConBaseTag"))
+				RegSetValueEx(hKey, _T("dwConBaseTag"), 0, REG_DWORD, &dwAddress, sizeof(dwAddress));
+			if (dwAddress = SymEng_GetAddr(dwBase, "FindProcessInList"))
+				RegSetValueEx(hKey, _T("FindProcessInList"), 0, REG_DWORD, &dwAddress, sizeof(dwAddress));
+			if (dwAddress = SymEng_GetAddr(dwBase, "CreateConsoleBitmap"))
+				RegSetValueEx(hKey, _T("CreateConsoleBitmap"), 0, REG_DWORD, &dwAddress, sizeof(dwAddress));
+			RegCloseKey(hKey);
+		}
+		SymEng_UnloadModule(dwBase);
+	}
+
+	return bUpdated;
+}
+#endif
+
+#ifdef CREATEPROCESS_HOOK
 typedef BOOL(WINAPI *CreateProcessAFunc)(LPCSTR lpApplicationName, LPSTR lpCommandLine, 
 	LPSECURITY_ATTRIBUTES lpProcessAttributes, LPSECURITY_ATTRIBUTES lpThreadAttributes, 
 	BOOL bInheritHandles, DWORD dwCreationFlags, LPVOID lpEnvironment, LPCSTR lpCurrentDirectory, 
@@ -390,6 +618,9 @@ BOOL WINAPI CreateProcessAHook(LPCSTR lpApplicationName, LPSTR lpCommandLine, LP
 	BOOL bRet;
 	DWORD dwDebugged = (dwCreationFlags&DEBUG_PROCESS) ?  0 : CREATE_SUSPENDED;
 
+#ifdef TARGET_WIN7
+	UpdateSymbolCache();
+#endif
 	bRet = CreateProcessAReal(lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, 
 		bInheritHandles, dwCreationFlags | dwDebugged, lpEnvironment, lpCurrentDirectory, lpStartupInfo,
 		lpProcessInformation);
@@ -413,6 +644,9 @@ BOOL WINAPI CreateProcessWHook(LPCWSTR lpApplicationName, LPWSTR lpCommandLine, 
 	BOOL bRet;
 	DWORD dwDebugged = (dwCreationFlags&DEBUG_PROCESS) ? 0 : CREATE_SUSPENDED;
 
+#ifdef TARGET_WIN7
+	UpdateSymbolCache();
+#endif
 	bRet = CreateProcessWReal(lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes,
 		bInheritHandles, dwCreationFlags | dwDebugged, lpEnvironment, lpCurrentDirectory, lpStartupInfo,
 		lpProcessInformation);
@@ -424,6 +658,7 @@ BOOL WINAPI CreateProcessWHook(LPCWSTR lpApplicationName, LPWSTR lpCommandLine, 
 	}
 	return bRet;
 }
+#endif
 
 typedef BOOL(WINAPI *fpSetConsolePalette)(IN HANDLE hConsoleOutput, IN HPALETTE hPalette, IN UINT dwUsage);
 fpSetConsolePalette SetConsolePaletteReal;
@@ -441,6 +676,7 @@ BOOL WINAPI mySetConsolePalette(IN HANDLE hConsoleOutput, IN HPALETTE hPalette, 
 	return SetConsolePaletteReal(hConsoleOutput, hPalette, dwUsage);
 }
 
+
 BOOL WINAPI _DllMainCRTStartup(
 	HANDLE  hDllHandle,
 	DWORD   dwReason,
@@ -453,24 +689,98 @@ BOOL WINAPI _DllMainCRTStartup(
 	{
 		STARTUPINFO si = { 0 };
 		HMODULE hKernelBase, hKrnl32;
-		LPBYTE lpProcII;
+		LPBYTE lpProcII = NULL;
 		int i;
 
 		hKrnl32 = GetModuleHandle(_T("kernel32.dll"));
 		hKernelBase = (HMODULE)GetModuleHandle(_T("KernelBase.dll"));
+
+#ifdef TARGET_WIN7
+		{
+/*
+			// Windows 7, all the stuff is internal in kernel32.dll :(
+			// But we cannot use the symbol loader in the module loading routine
+			DWORD64 dwBase=0, dwAddress;
+			char szKernel32[MAX_PATH];
+			GetSystemDirectoryA(szKernel32, sizeof(szKernel32) / sizeof(szKernel32[0]));
+			lstrcatA(szKernel32, "\\kernel32.dll");
+			if (SymEng_LoadModule(szKernel32, &dwBase) == 0)
+			{
+				if (dwAddress = SymEng_GetAddr(dwBase, "BasepProcessInvalidImage"))
+				{
+					lpProcII = (DWORD64)hKrnl32 + dwAddress;
+					BasepProcessInvalidImageReal = (fpBasepProcessInvalidImage)Hook_Inline(lpProcII, BasepProcessInvalidImage, 10);
+				}
+				if (dwAddress = SymEng_GetAddr(dwBase, "BaseIsDosApplication"))
+					BaseIsDosApplication = (DWORD64)hKrnl32 + dwAddress;
+			}
+*/
+
+			DWORD dwRet, dwAddress, cbData;
+			HKEY hKey;
+
+			if ((dwRet = RegOpenKeyEx(HKEY_CURRENT_USER, _T("Software\\ldntvdm"), 0, KEY_READ, &hKey)) == ERROR_SUCCESS)
+			{
+				cbData = sizeof(dwAddress);
+				if ((dwRet = RegQueryValueEx(hKey, REGKEY_BasepProcessInvalidImage, NULL, NULL, &dwAddress, &cbData)) == ERROR_SUCCESS)
+				{
+					lpProcII = (DWORD64)hKrnl32 + dwAddress;
+					BasepProcessInvalidImageReal = (fpBasepProcessInvalidImage)Hook_Inline(lpProcII, BasepProcessInvalidImage);
+				}
+				else
+				{
+					TRACE("RegQueryValueEx 1 failed: %08X", dwRet);
+				}
+				cbData = sizeof(dwAddress);
+				if ((dwRet = RegQueryValueEx(hKey, REGKEY_BaseIsDosApplication, NULL, NULL, &dwAddress, &cbData)) == ERROR_SUCCESS)
+					BaseIsDosApplication = (DWORD64)hKrnl32 + dwAddress;
+				else
+				{
+					TRACE("RegQueryValueEx 2 failed: %08X", dwRet);
+				}
+				RegCloseKey(hKey);
+			}
+			else
+			{
+				TRACE("RegOpenKey failed: %08X", dwRet);
+			}
+
+
+#ifdef CREATEPROCESS_HOOK
+			CreateProcessAReal = Hook_Inline(CreateProcessA, CreateProcessAHook);
+			CreateProcessWReal = Hook_Inline(CreateProcessW, CreateProcessWHook);
+#endif
+		}
+#ifdef WOW16_SUPPORT
+		if (!Hook_IAT_x64_IAT((LPBYTE)hKrnl32, "ntdll.dll", "NtCreateUserProcess", NtCreateUserProcessHook, &NtCreateUserProcessReal))
+			OutputDebugStringA("Hooking NtCreateUserProcess failed.");
+#endif	// WOW16_SUPPORT
+
+#else
+		// Windows 10
 		lpProcII = (LPBYTE)GetProcAddress(hKrnl32, "BasepProcessInvalidImage");
 		BasepProcessInvalidImageReal = (fpBasepProcessInvalidImage)lpProcII;
-		TRACE("LDNTVDM: BasepProcessInvalidImageReal = %08X", BasepProcessInvalidImageReal);
 		BaseIsDosApplication = GetProcAddress(hKrnl32, "BaseIsDosApplication");
-		TRACE("LDNTVDM: BaseIsDosApplication = %08X", BaseIsDosApplication);
-		Hook_IAT_x64((LPBYTE)hKernelBase, "KERNEL32.DLL", "ext-ms-win-kernelbase-processthread-l1-1-0.dll", 
+		Hook_IAT_x64((LPBYTE)hKernelBase, "KERNEL32.DLL", "ext-ms-win-kernelbase-processthread-l1-1-0.dll",
 			"BasepProcessInvalidImage", BasepProcessInvalidImage);
+#ifdef CREATEPROCESS_HOOK
+		/* Newer Windows Versions use l1-1-0 instead of l1-1-2 */
+		if (!Hook_IAT_x64_IAT((LPBYTE)hKrnl32, "api-ms-win-core-processthreads-l1-1-2.dll", "CreateProcessA", CreateProcessAHook, &CreateProcessAReal))
+			Hook_IAT_x64_IAT((LPBYTE)hKrnl32, "api-ms-win-core-processthreads-l1-1-0.dll", "CreateProcessA", CreateProcessAHook, &CreateProcessAReal);
+		if (!Hook_IAT_x64_IAT((LPBYTE)hKrnl32, "api-ms-win-core-processthreads-l1-1-2.dll", "CreateProcessW", CreateProcessWHook, &CreateProcessWReal))
+			Hook_IAT_x64_IAT((LPBYTE)hKrnl32, "api-ms-win-core-processthreads-l1-1-0.dll", "CreateProcessW", CreateProcessWHook, &CreateProcessWReal);
+#endif
+#ifdef WOW16_SUPPORT
+		if (!Hook_IAT_x64_IAT((LPBYTE)hKernelBase, "ntdll.dll", "NtCreateUserProcess", NtCreateUserProcessHook, &NtCreateUserProcessReal))
+			OutputDebugStringA("Hooking NtCreateUserProcess failed.");
+#endif	// WOW16_SUPPORT
+#endif 
+		TRACE("LDNTVDM: BasepProcessInvalidImageReal = %08X", BasepProcessInvalidImageReal);
+		TRACE("LDNTVDM: BaseIsDosApplication = %08X", BaseIsDosApplication);
 
-		Hook_IAT_x64_IAT((LPBYTE)hKrnl32, "api-ms-win-core-processthreads-l1-1-2.dll", "CreateProcessA", CreateProcessAHook, &CreateProcessAReal);
-		Hook_IAT_x64_IAT((LPBYTE)hKrnl32, "api-ms-win-core-processthreads-l1-1-2.dll", "CreateProcessW", CreateProcessWHook, &CreateProcessWReal);
+		FixNTDLL();
 
 #ifdef _WIN64
-		FixNTDLL();
 		{
 			TCHAR szProcess[MAX_PATH], *p;
 
@@ -480,11 +790,23 @@ BOOL WINAPI _DllMainCRTStartup(
 			if (lstrcmpi(++p, _T("ConHost.exe")) == 0)
 			{
 				TRACE("LDNTVDM is running inside ConHost.exe");
+#ifdef TARGET_WIN7
+				ConsBmp_Install();
+				Hook_IAT_x64_IAT((LPBYTE)GetModuleHandle(NULL), "ntdll.dll", "RtlAllocateHeap", RtlAllocateHeapHook, &RtlAllocateHeapReal);
+#else
 				if (hKrnl32 = GetModuleHandle(_T("ConHostV1.dll")))
 					Hook_IAT_x64_IAT((LPBYTE)hKrnl32, "ntdll.dll", "RtlAllocateHeap", RtlAllocateHeapHook, &RtlAllocateHeapReal);
 				else
 					Hook_IAT_x64_IAT((LPBYTE)GetModuleHandle(NULL), "api-ms-win-core-libraryloader-l1-2-0.dll", "LoadLibraryExW", LoadLibraryExWHook, &LoadLibraryExWReal);
-				
+#endif
+#ifndef CREATEPROCESS_HOOK
+				// We want notification when new console process gets started so that we can inject
+#ifdef TARGET_WIN7
+				Hook_IAT_x64_IAT((LPBYTE)GetModuleHandle(NULL), "user32.dll", "NotifyWinEvent", NotifyWinEventHook, &NotifyWinEventReal);
+#else
+				if (hKrnl32) Hook_IAT_x64_IAT((LPBYTE)hKrnl32, "user32.dll", "NotifyWinEvent", NotifyWinEventHook, &NotifyWinEventReal);
+#endif
+#endif
 			}
 		}
 #else

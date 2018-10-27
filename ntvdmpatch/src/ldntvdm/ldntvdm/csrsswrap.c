@@ -44,6 +44,7 @@ NTSTATUS CallBaseUpdateVDMEntry(BASE_API_MSG *m32, CSR_API_NUMBER ApiNumber)
 	b->VDMCreationState = b32->VDMCreationState;
 
 	Status = CsrClientCallServer((struct _CSR_API_MESSAGE*)&m, NULL, ApiNumber, sizeof(*b));
+	TRACE("BaseUpdateVDMEntry(%d) = %08X", ApiNumber, Status);
 	m32->ReturnValue = m.ReturnValue;
 	b32->WaitObjectForParent = b->WaitObjectForParent;
 
@@ -58,6 +59,7 @@ NTSTATUS CallBaseIsFirstVDM(BASE_API_MSG *m32, CSR_API_NUMBER ApiNumber)
 	NTSTATUS Status;
 
 	Status = CsrClientCallServer((struct _CSR_API_MESSAGE*)&m, NULL, ApiNumber, sizeof(*b));
+	TRACE("BaseIsFirstVDM(%d) = %08X", ApiNumber, Status);
 	b32->FirstVDM = b->FirstVDM;
 	m32->ReturnValue = m.ReturnValue;
 
@@ -75,6 +77,7 @@ NTSTATUS CallBaseSetReenterCount(BASE_API_MSG *m32, CSR_API_NUMBER ApiNumber)
 	b->ConsoleHandle = b32->ConsoleHandle;
 	b->fIncDec = b32->fIncDec;
 	Status = CsrClientCallServer((struct _CSR_API_MESSAGE*)&m, NULL, ApiNumber, sizeof(*b));
+	TRACE("BaseSetReenterCount(%d) = %08X", ApiNumber, Status);
 	m32->ReturnValue = m.ReturnValue;
 
 	return Status;
@@ -90,6 +93,7 @@ NTSTATUS CallBaseGetVDMExitCode(BASE_API_MSG *m32, CSR_API_NUMBER ApiNumber)
 	b->ConsoleHandle = b32->ConsoleHandle;
 	b->hParent = b32->hParent;
 	Status = CsrClientCallServer((struct _CSR_API_MESSAGE*)&m, NULL, ApiNumber, sizeof(*b));
+	TRACE("BaseGetVDMExitCode(%d) = %08X", ApiNumber, Status);
 	m32->ReturnValue = m.ReturnValue;
 	b32->ExitCode = b->ExitCode;
 
@@ -106,7 +110,59 @@ NTSTATUS CallBaseExitVDM(BASE_API_MSG *m32, CSR_API_NUMBER ApiNumber)
 	b->ConsoleHandle = (ULONGLONG)b32->ConsoleHandle;
 	b->iWowTask = b32->iWowTask;
 	Status = CsrClientCallServer((struct _CSR_API_MESSAGE*)&m, NULL, ApiNumber, sizeof(*b));
+	TRACE("BaseExitVDM(%d) = %08X", ApiNumber, Status);
 	b32->WaitObjectForVDM = (ULONGLONG)b->WaitObjectForVDM;
+	m32->ReturnValue = m.ReturnValue;
+
+	return Status;
+}
+
+NTSTATUS CallBaseGetSetVDMCurDirs(BASE_API_MSG *m32, CSR_API_NUMBER ApiNumber, BOOL bGet)
+{
+	BASE_API_MSG64 m;
+	BASE_GET_SET_VDM_CUR_DIRS_MSG64 *b = (BASE_GET_SET_VDM_CUR_DIRS_MSG64*)&m.u.GetSetVDMCurDirs;
+	BASE_GET_SET_VDM_CUR_DIRS_MSG *b32 = (BASE_GET_SET_VDM_CUR_DIRS_MSG*)&m32->u.GetSetVDMCurDirs;
+	NTSTATUS Status;
+	PCSR_CAPTURE_HEADER CaptureBuffer = NULL;
+
+	if (b32->cchCurDirs && b32->lpszzCurDirs)
+	{
+		if (!(CaptureBuffer = (ULONG_PTR)CsrAllocateCaptureBuffer(1, b32->cchCurDirs)))
+		{
+			SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+			return STATUS_NO_MEMORY;
+		}
+		CsrAllocateMessagePointer(CaptureBuffer, ROUND_UP(b32->cchCurDirs, 8), (PVOID *)&b->lpszzCurDirs);
+		if (!bGet) RtlMoveMemory(b->lpszzCurDirs, b32->lpszzCurDirs, b32->cchCurDirs);
+	}
+	else b->lpszzCurDirs = b32->lpszzCurDirs;
+	b->ConsoleHandle = (ULONGLONG)b32->ConsoleHandle;
+	b->cchCurDirs = b32->cchCurDirs;
+
+	Status = CsrClientCallServer((struct _CSR_API_MESSAGE*)&m, CaptureBuffer, ApiNumber, sizeof(*b));
+	TRACE("CallBase%sVDMCurDirs(%08X) = %08X", bGet?"Get":"Set", b32->ConsoleHandle, Status);
+
+	m32->ReturnValue = m.ReturnValue;
+	if (bGet && b->lpszzCurDirs)
+	{
+		RtlMoveMemory(b32->lpszzCurDirs, b->lpszzCurDirs, b->cchCurDirs);
+		b32->cchCurDirs = b->cchCurDirs;
+	}
+	if (CaptureBuffer) CsrFreeCaptureBuffer(CaptureBuffer);
+	return Status;
+}
+
+NTSTATUS CallBaseRegisterWowExec(BASE_API_MSG *m32, CSR_API_NUMBER ApiNumber)
+{
+	BASE_API_MSG64 m;
+	BASE_REGISTER_WOWEXEC_MSG64 *b = (BASE_REGISTER_WOWEXEC_MSG64*)&m.u.RegisterWowExec;
+	BASE_REGISTER_WOWEXEC_MSG *b32 = (BASE_REGISTER_WOWEXEC_MSG*)&m32->u.RegisterWowExec;
+	NTSTATUS Status;
+
+	b->hwndWowExec = (ULONGLONG)b32->hwndWowExec;
+	b->ConsoleHandle = (ULONGLONG)b32->ConsoleHandle;
+	Status = CsrClientCallServer((struct _CSR_API_MESSAGE*)&m, NULL, ApiNumber, sizeof(*b));
+	TRACE("BaseRegisterWowExex(%d) = %08X", ApiNumber, Status);
 	m32->ReturnValue = m.ReturnValue;
 
 	return Status;
@@ -236,7 +292,9 @@ NTSTATUS CallBaseCheckVDM(BASE_API_MSG *m32, CSR_API_NUMBER ApiNumber)
 	b->dwCreationFlags = b32->dwCreationFlags;
 	b->iTask = b32->iTask;
 
+	TRACE("BaseCheckVDM: ConsoleHandle=%08X, iTask=%08X", b32->ConsoleHandle, b32->iTask);
 	Status = CsrClientCallServer(&m, CaptureBuffer, ApiNumber, sizeof(*b));
+	TRACE("BaseCheckVDM(%d) = %08X", ApiNumber, Status);
 
 	m32->ReturnValue = m.ReturnValue;
 	b32->iTask = b->iTask;
@@ -360,7 +418,9 @@ NTSTATUS CallBaseGetNextVDMCommand(BASE_API_MSG *m32, CSR_API_NUMBER ApiNumber)
 		b->ReservedLen = b32->ReservedLen;
 	}
 
+	TRACE("BaseGetNextVDMCommand: ConsoleHandle=%08X, iTask=%08X", b32->ConsoleHandle, b32->iTask);
 	Status = CsrClientCallServer(&m, CaptureBuffer, ApiNumber, sizeof(*b));
+	TRACE("BaseGetNextVDMCommand(%d) = %08X", ApiNumber, Status);
 
 	m32->ReturnValue = m.ReturnValue;
 	if (b->VDMState & STARTUP_INFO_RETURNED)
@@ -450,6 +510,12 @@ NTSTATUS NTAPI myCsrClientCallServer(BASE_API_MSG *m, PCSR_CAPTURE_HEADER Captur
 			return CallBaseUpdateVDMEntry(m, ApiNumber);
 		case BasepGetNextVDMCommand:
 			return CallBaseGetNextVDMCommand(m, ApiNumber);
+		case BasepGetVDMCurDirs:
+			return CallBaseGetSetVDMCurDirs(m, ApiNumber, TRUE);
+		case BasepSetVDMCurDirs:
+			return CallBaseGetSetVDMCurDirs(m, ApiNumber, FALSE);
+		case BasepRegisterWowExec:
+			return CallBaseRegisterWowExec(m, ApiNumber);
 		}
 	}
 	Status = CsrClientCallServerReal(m, CaptureHeader, ApiNumber, ArgLength);
